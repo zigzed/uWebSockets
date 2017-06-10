@@ -16,7 +16,7 @@ enum ListenOptions {
 struct Hub;
 
 template <bool isServer>
-struct WIN32_EXPORT Group : private uS::NodeData {
+struct WIN32_EXPORT Group : private uS::Context {
 protected:
     friend struct Hub;
     friend struct WebSocket<isServer>;
@@ -41,25 +41,26 @@ protected:
 
     Hub *hub;
     int extensionOptions;
-    Timer *timer = nullptr, *httpTimer = nullptr;
+    uS::Loop::Timer *timer = nullptr, *httpTimer = nullptr;
     std::string userPingMessage;
-    std::stack<Poll *> iterators;
+    std::stack<void *> iterators;
 
-    // todo: cannot be named user, collides with parent!
     void *userData = nullptr;
-    static void timerCallback(Timer *timer);
+    static void timerCallback(uS::Loop::Timer *timer);
+    static void limboTimerCallback(uS::Loop::Timer *timer);
 
-    WebSocket<isServer> *webSocketHead = nullptr;
-    HttpSocket<isServer> *httpSocketHead = nullptr;
+    enum {
+        WEBSOCKET,
+        HTTPSOCKET,
+        WEBSOCKET_SHUTDOWN,
+        HTTPSOCKET_CONNECT,
+        SIZE
+    };
+    Socket *chainHead[SIZE] = {};
+    void add(int chainIndex, uS::Socket *socket);
+    void remove(int chainIndex, uS::Socket *socket);
 
-    void addWebSocket(WebSocket<isServer> *webSocket);
-    void removeWebSocket(WebSocket<isServer> *webSocket);
-
-    // todo: remove these, template
-    void addHttpSocket(HttpSocket<isServer> *httpSocket);
-    void removeHttpSocket(HttpSocket<isServer> *httpSocket);
-
-    Group(int extensionOptions, Hub *hub, uS::NodeData *nodeData);
+    Group(int extensionOptions, uS::Loop *loop);
     void stopListening();
 
 public:
@@ -89,44 +90,21 @@ public:
 
     // same as listen(TRANSFERS), backwards compatible API for now
     void addAsync() {
-        if (!async) {
-            NodeData::addAsync();
-        }
-    }
-
-    void listen(ListenOptions listenOptions) {
-        if (listenOptions == TRANSFERS && !async) {
-            addAsync();
-        }
+//        if (!async) {
+//            NodeData::addAsync();
+//        }
     }
 
     template <class F>
-    void forEach(const F &cb) {
-        Poll *iterator = webSocketHead;
+    void forEach(int chainIndex, const F &cb) {
+        uS::Socket *iterator = chainHead[chainIndex];
         iterators.push(iterator);
         while (iterator) {
-            Poll *lastIterator = iterator;
-            cb((WebSocket<isServer> *) iterator);
-            iterator = iterators.top();
+            uS::Socket *lastIterator = iterator;
+            cb(iterator);
+            iterator = static_cast<uS::Socket *>(iterators.top());
             if (lastIterator == iterator) {
-                iterator = ((uS::Socket *) iterator)->next;
-                iterators.top() = iterator;
-            }
-        }
-        iterators.pop();
-    }
-
-    // duplicated code for now!
-    template <class F>
-    void forEachHttpSocket(const F &cb) {
-        Poll *iterator = httpSocketHead;
-        iterators.push(iterator);
-        while (iterator) {
-            Poll *lastIterator = iterator;
-            cb((HttpSocket<isServer> *) iterator);
-            iterator = iterators.top();
-            if (lastIterator == iterator) {
-                iterator = ((uS::Socket *) iterator)->next;
+                iterator = static_cast<uS::Socket *>(iterator->next);
                 iterators.top() = iterator;
             }
         }
@@ -134,7 +112,7 @@ public:
     }
 
     static Group<isServer> *from(uS::Socket *s) {
-        return static_cast<Group<isServer> *>(s->getNodeData());
+        return static_cast<Group<isServer> *>(s->getContext());
     }
 };
 

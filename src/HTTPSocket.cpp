@@ -1,6 +1,7 @@
 #include "HTTPSocket.h"
 #include "Group.h"
 #include "Extensions.h"
+#include <openssl/sha.h>
 #include <cstdio>
 
 #define MAX_HEADERS 100
@@ -54,6 +55,7 @@ static void base64(unsigned char *src, char *dst) {
 
 template <bool isServer>
 uS::Socket *HttpSocket<isServer>::onData(uS::Socket *s, char *data, size_t length) {
+
     HttpSocket<isServer> *httpSocket = (HttpSocket<isServer> *) s;
 
     httpSocket->cork(true);
@@ -62,6 +64,8 @@ uS::Socket *HttpSocket<isServer>::onData(uS::Socket *s, char *data, size_t lengt
         httpSocket->missedDeadline = false;
         if (httpSocket->contentLength >= length) {
             Group<isServer>::from(httpSocket)->httpDataHandler(httpSocket->outstandingResponsesTail, data, length, httpSocket->contentLength -= length);
+            // not worth corking?
+            httpSocket->cork(false);
             return httpSocket;
         } else {
             Group<isServer>::from(httpSocket)->httpDataHandler(httpSocket->outstandingResponsesTail, data, httpSocket->contentLength, 0);
@@ -106,18 +110,18 @@ uS::Socket *HttpSocket<isServer>::onData(uS::Socket *s, char *data, size_t lengt
                             bool perMessageDeflate;
                             httpSocket->upgrade(secKey.value, extensions.value, extensions.valueLength,
                                                subprotocol.value, subprotocol.valueLength, &perMessageDeflate);
-                            Group<isServer>::from(httpSocket)->removeHttpSocket(httpSocket);
+
+                            Group<isServer> *group = Group<isServer>::from(httpSocket);
+                            group->remove(Group<isServer>::HTTPSOCKET, httpSocket);
 
                             // Warning: changes socket, needs to inform the stack of Poll address change!
                             WebSocket<isServer> *webSocket = new WebSocket<isServer>(perMessageDeflate, httpSocket);
-                            webSocket->template setState<WebSocket<isServer>>();
-                            webSocket->change(webSocket->nodeData->loop, webSocket, webSocket->setPoll(UV_READABLE));
-                            Group<isServer>::from(webSocket)->addWebSocket(webSocket);
-
-                            webSocket->cork(true);
-                            Group<isServer>::from(webSocket)->connectionHandler(webSocket, req);
-                            // todo: should not uncork if closed!
-                            webSocket->cork(false);
+                            webSocket->setDerivative(WEB_SOCKET_SERVER);
+                            group->add(Group<isServer>::WEBSOCKET, webSocket);
+                            group->connectionHandler(webSocket, req);
+                            if (!webSocket->isClosed()) {
+                                webSocket->cork(false);
+                            }
                             delete httpSocket;
 
                             return webSocket;
@@ -147,11 +151,14 @@ uS::Socket *HttpSocket<isServer>::onData(uS::Socket *s, char *data, size_t lengt
                             Group<SERVER>::from(httpSocket)->httpRequestHandler(res, req, nullptr, 0, 0);
                         }
 
+                        // fix this! corking should happen even if is shutting down!
                         if (httpSocket->isClosed() || httpSocket->isShuttingDown()) {
+                            // should uncokr here to release any shutdown sends
                             return httpSocket;
                         }
                     } else {
                         httpSocket->onEnd(httpSocket);
+                        httpSocket->cork(false); // added recently
                         return httpSocket;
                     }
                 }
@@ -160,24 +167,25 @@ uS::Socket *HttpSocket<isServer>::onData(uS::Socket *s, char *data, size_t lengt
 
                     // Warning: changes socket, needs to inform the stack of Poll address change!
                     WebSocket<isServer> *webSocket = new WebSocket<isServer>(false, httpSocket);
-                    httpSocket->cancelTimeout();
+                    webSocket->setDerivative(WEB_SOCKET_CLIENT);
+//                    httpSocket->cancelTimeout();
                     webSocket->setUserData(httpSocket->httpUser);
-                    webSocket->template setState<WebSocket<isServer>>();
-                    webSocket->change(webSocket->nodeData->loop, webSocket, webSocket->setPoll(UV_READABLE));
-                    Group<isServer>::from(webSocket)->addWebSocket(webSocket);
+                    //Group<isServer>::from(webSocket)->add(Group<isServer>::WEBSOCKET, webSocket);
 
-                    webSocket->cork(true);
                     Group<isServer>::from(webSocket)->connectionHandler(webSocket, req);
-                    if (!(webSocket->isClosed() || webSocket->isShuttingDown())) {
-                        WebSocketProtocol<isServer, WebSocket<isServer>>::consume(cursor, end - cursor, webSocket);
+                    if (!webSocket->isClosed()) {
+                        if (!webSocket->isShuttingDown()) {
+                            WebSocketProtocol<isServer, WebSocket<isServer>>::consume(cursor, end - cursor, webSocket);
+                        }
+                        webSocket->cork(false);
                     }
-                    webSocket->cork(false);
                     delete httpSocket;
 
                     return webSocket;
                 } else {
                     httpSocket->onEnd(httpSocket);
                 }
+                httpSocket->cork(false); // added recently
                 return httpSocket;
             }
         } else {
@@ -188,6 +196,7 @@ uS::Socket *HttpSocket<isServer>::onData(uS::Socket *s, char *data, size_t lengt
                     httpSocket->httpBuffer.append(lastCursor, end - lastCursor);
                 }
             }
+            httpSocket->cork(false); // added recently
             return httpSocket;
         }
     } while(cursor != end);
@@ -250,32 +259,28 @@ void HttpSocket<isServer>::upgrade(const char *secKey, const char *extensions, s
         httpBuffer.clear();
     }
 
-    bool wasTransferred;
-    if (write(messagePtr, wasTransferred)) {
-        if (!wasTransferred) {
-            freeMessage(messagePtr);
-        } else {
-            messagePtr->callback = nullptr;
-        }
-    } else {
+    messagePtr->callback = nullptr;
+    if (sendMessage(messagePtr, true)) {
         freeMessage(messagePtr);
     }
 }
 
 template <bool isServer>
 void HttpSocket<isServer>::onEnd(uS::Socket *s) {
-    HttpSocket<isServer> *httpSocket = (HttpSocket<isServer> *) s;
+    HttpSocket<isServer> *httpSocket = static_cast<HttpSocket<isServer> *>(s);
 
     if (!httpSocket->isShuttingDown()) {
         if (isServer) {
-            Group<isServer>::from(httpSocket)->removeHttpSocket(httpSocket);
+            Group<isServer>::from(httpSocket)->remove(Group<isServer>::HTTPSOCKET, httpSocket);
             Group<isServer>::from(httpSocket)->httpDisconnectionHandler(httpSocket);
         }
     } else {
-        httpSocket->cancelTimeout();
+        //httpSocket->cancelTimeout();
     }
 
-    httpSocket->template closeSocket<HttpSocket<isServer>>();
+    httpSocket->close([](uS::Socket *socket) {
+        delete static_cast<HttpSocket<isServer> *>(socket);
+    });
 
     while (!httpSocket->messageQueue.empty()) {
         Queue::Message *message = httpSocket->messageQueue.front();
@@ -296,10 +301,10 @@ void HttpSocket<isServer>::onEnd(uS::Socket *s) {
         delete httpSocket->preAllocatedResponse;
     }
 
-    httpSocket->nodeData->clearPendingPollChanges(httpSocket);
+    //httpSocket->nodeData->clearPendingPollChanges(httpSocket);
 
     if (!isServer) {
-        httpSocket->cancelTimeout();
+        //httpSocket->cancelTimeout();
         Group<CLIENT>::from(httpSocket)->errorHandler(httpSocket->httpUser);
     }
 }
