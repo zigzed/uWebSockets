@@ -91,6 +91,7 @@ struct Timer {
         );
 
         loop->delay = -1;
+	loop->numPolls++;
         if (loop->timers.size()) {
             loop->delay = std::max<int>(std::chrono::duration_cast<std::chrono::milliseconds>(loop->timers[0].timepoint - loop->timepoint).count(), 0);
         }
@@ -120,6 +121,7 @@ struct Timer {
         }
 
         loop->delay = -1;
+	loop->numPolls--;
         if (loop->timers.size()) {
             loop->delay = std::max<int>(std::chrono::duration_cast<std::chrono::milliseconds>(loop->timers[0].timepoint - loop->timepoint).count(), 0);
         }
